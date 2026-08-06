@@ -1,0 +1,391 @@
+import os
+import uuid
+import logging
+import asyncio
+from typing import Dict
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+import pypdf
+import google.generativeai as genai
+from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# Slowapi for Rate Limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# OCR Support (Optional imports with fallback)
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# 📝 1. Logging Setup (Replacing print statements)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("student_hub")
+
+# Directory Setup
+UPLOAD_DIR = "uploads"
+OUTPUT_DIR = "outputs"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+MAX_FILE_SIZE_MB = 20
+ALLOWED_EXTENSIONS = [".pdf"]
+
+# 🚦 4. Rate Limiting Setup
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Student Hub - AI Audio Podcast Generator")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# 🌐 3. CORS Middleware Support
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Production me specific domains set karein (e.g., ["https://studenthub.com"])
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global job status store
+jobs_status: Dict[str, Dict] = {}
+
+# API Key Validation
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+def validate_api_keys():
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
+        logger.error("Gemini API key is missing or default.")
+        raise ValueError("Gemini API key missing or invalid.")
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
+        logger.error("OpenAI API key is missing or default.")
+        raise ValueError("OpenAI API key missing or invalid.")
+
+genai.configure(api_key=GEMINI_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+
+
+# Auto Delete Utility
+def remove_file_delayed(filepath: str, delay_seconds: int = 600):
+    async def _cleanup():
+        await asyncio.sleep(delay_seconds)
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                logger.info(f"Auto-deleted file: {filepath}")
+            except Exception as e:
+                logger.error(f"Failed to delete file {filepath}: {str(e)}")
+    asyncio.create_task(_cleanup())
+
+
+# PDF Text Extraction with OCR Support
+def extract_text_with_ocr_fallback(pdf_path: str) -> str:
+    text = ""
+    with open(pdf_path, "rb") as f:
+        reader = pypdf.PdfReader(f)
+        for page in reader.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted + "\n"
+
+    if not text.strip() and OCR_AVAILABLE:
+        logger.info(f"No direct text found in {pdf_path}. Attempting OCR fallback...")
+        try:
+            images = convert_from_path(pdf_path)
+            for img in images:
+                text += pytesseract.image_to_string(img) + "\n"
+        except Exception as e:
+            logger.error(f"OCR failed for {pdf_path}: {str(e)}")
+
+    return text.strip()
+
+
+# 🔄 2. Retry Mechanism for External APIs
+@retry(
+    stop=stop_after_attempt(3), 
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
+def call_gemini_api(prompt: str):
+    logger.info("Calling Gemini API...")
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    response = model.generate_content(prompt)
+    return response.text
+
+
+@retry(
+    stop=stop_after_attempt(3), 
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
+def call_openai_tts(script: str, voice: str):
+    logger.info(f"Calling OpenAI TTS API with voice: {voice}...")
+    return openai_client.audio.speech.create(
+        model="tts-1",
+        voice=voice,
+        input=script[:4000]
+    )
+
+
+def generate_podcast_script(text_content: str) -> str:
+    prompt = f"""
+    You are an expert tutor. Convert these notes into a short, natural, engaging revision podcast script in Hinglish.
+    Notes:
+    {text_content[:4000]}
+    """
+    return call_gemini_api(prompt)
+
+
+# Background Audio Processing Job
+async def process_audio_job(job_id: str, file_path: str, voice: str, original_filename: str):
+    try:
+        jobs_status[job_id] = {"progress": 20, "status": "Reading & Extracting Text (OCR)..."}
+        logger.info(f"Job {job_id}: Extracting text from PDF...")
+
+        text = await asyncio.to_thread(extract_text_with_ocr_fallback, file_path)
+        if not text:
+            jobs_status[job_id] = {"progress": 0, "status": "Error: No readable text found in PDF."}
+            logger.warning(f"Job {job_id}: No text extracted.")
+            return
+
+        jobs_status[job_id] = {"progress": 50, "status": "Generating Script with Gemini AI..."}
+        logger.info(f"Job {job_id}: Generating podcast script...")
+        script = await asyncio.to_thread(generate_podcast_script, text)
+
+        jobs_status[job_id] = {"progress": 75, "status": f"Converting Speech using OpenAI ({voice})..."}
+        logger.info(f"Job {job_id}: Generating audio via OpenAI TTS...")
+        
+        output_filename = f"{uuid.uuid4()}.mp3"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+        audio_response = await asyncio.to_thread(call_openai_tts, script, voice)
+        audio_response.stream_to_file(output_path)
+
+        remove_file_delayed(output_path, delay_seconds=600)
+
+        jobs_status[job_id] = {
+            "progress": 100,
+            "status": "Complete!",
+            "audio_url": f"/outputs/{output_filename}",
+            "filename": f"podcast_{os.path.splitext(original_filename)[0]}.mp3",
+            "script": script
+        }
+        logger.info(f"Job {job_id}: Successfully processed.")
+
+    except Exception as e:
+        logger.error(f"Job {job_id} failed with error: {str(e)}")
+        jobs_status[job_id] = {"progress": 0, "status": f"Error: Processing failed after retries."}
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+
+# ❤️ 5. Health Check Endpoint
+@app.get("/health")
+async def health_check():
+    """Deployment monitoring ke liye health status check."""
+    return {
+        "status": "healthy",
+        "ocr_available": OCR_AVAILABLE,
+        "uploads_dir": os.path.exists(UPLOAD_DIR),
+        "outputs_dir": os.path.exists(OUTPUT_DIR)
+    }
+
+
+# Progress Polling Endpoint
+@app.get("/api/progress/{job_id}")
+async def get_progress(job_id: str):
+    return jobs_status.get(job_id, {"progress": 0, "status": "Initializing..."})
+
+
+# 🚦 Rate Limited Generation Endpoint (Max 5 requests per minute per IP)
+@app.post("/api/generate-audio")
+@limiter.limit("5/minute")
+async def generate_audio_notes(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    voice: str = Form("alloy")
+):
+    try:
+        validate_api_keys()
+    except ValueError as err:
+        raise HTTPException(status_code=500, detail=str(err))
+
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files allowed.")
+
+    job_id = str(uuid.uuid4())
+    temp_filename = f"{job_id}.pdf"
+    temp_file_path = os.path.join(UPLOAD_DIR, temp_filename)
+
+    file_size = 0
+    with open(temp_file_path, "wb") as buffer:
+        while chunk := await file.read(1024 * 1024):
+            file_size += len(chunk)
+            if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+                buffer.close()
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                logger.warning(f"File upload blocked: Size exceeded {MAX_FILE_SIZE_MB}MB limit.")
+                raise HTTPException(status_code=400, detail="File exceeds 20MB limit.")
+            buffer.write(chunk)
+
+    logger.info(f"Received file: {file.filename}, assigned Job ID: {job_id}")
+    jobs_status[job_id] = {"progress": 5, "status": "File Uploaded Successfully"}
+
+    background_tasks.add_task(process_audio_job, job_id, temp_file_path, voice, file.filename)
+
+    return {"job_id": job_id}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def get_frontend():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Student Hub - AI Audio Podcast</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f4f7f6; margin: 0; padding: 20px; display: flex; justify-content: center; }
+            .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); max-width: 600px; width: 100%; }
+            h2 { color: #2c3e50; margin-top: 0; text-align: center; }
+            .drag-box { border: 2px dashed #007bff; border-radius: 10px; padding: 30px; text-align: center; background: #eef6ff; cursor: pointer; transition: 0.3s; margin-bottom: 20px; }
+            .drag-box.hover { background: #d0e4ff; border-color: #0056b3; }
+            input[type="file"] { display: none; }
+            select, button { width: 100%; padding: 12px; margin-top: 10px; border-radius: 6px; border: 1px solid #ccc; font-size: 15px; }
+            button { background: #007bff; color: white; border: none; font-weight: bold; cursor: pointer; }
+            button:disabled { background: #ccc; cursor: not-allowed; }
+            .progress-container { width: 100%; background: #e0e0e0; border-radius: 6px; height: 12px; margin-top: 15px; overflow: hidden; display: none; }
+            .progress-bar { width: 0%; height: 100%; background: #007bff; transition: width 0.3s; }
+            #statusText { font-size: 13px; text-align: center; margin-top: 8px; font-weight: 600; color: #444; }
+            .result-box { margin-top: 20px; display: none; }
+            audio { width: 100%; margin-top: 10px; }
+            .download-btn { display: inline-block; width: 96%; text-align: center; background: #28a745; color: white; padding: 10px; margin-top: 10px; text-decoration: none; border-radius: 6px; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>🎓 Student Hub: AI Audio Notes</h2>
+            
+            <div class="drag-box" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                <span id="dropText">🖱️ Drag & Drop PDF here or Click to Browse</span>
+                <input type="file" id="fileInput" accept=".pdf">
+            </div>
+
+            <label>🎙️ Voice Selection:</label>
+            <select id="voiceSelect">
+                <option value="alloy">Alloy (Neutral)</option>
+                <option value="echo">Echo (Male Calm)</option>
+                <option value="nova">Nova (Energetic Female)</option>
+                <option value="onyx">Onyx (Deep Male)</option>
+            </select>
+
+            <button id="submitBtn" onclick="startGeneration()">🚀 Generate Audio</button>
+
+            <div class="progress-container" id="progressBox">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div id="statusText"></div>
+
+            <div class="result-box" id="resultBox">
+                <h3>🎉 Generated Audio:</h3>
+                <audio id="audioPlayer" controls></audio>
+                <a id="downloadBtn" class="download-btn">📥 Download MP3</a>
+            </div>
+        </div>
+
+        <script>
+            const dropZone = document.getElementById('dropZone');
+            const fileInput = document.getElementById('fileInput');
+            let selectedFile = null;
+
+            ['dragenter', 'dragover'].forEach(eName => {
+                dropZone.addEventListener(eName, (e) => { e.preventDefault(); dropZone.classList.add('hover'); }, false);
+            });
+            ['dragleave', 'drop'].forEach(eName => {
+                dropZone.addEventListener(eName, (e) => { e.preventDefault(); dropZone.classList.remove('hover'); }, false);
+            });
+
+            dropZone.addEventListener('drop', (e) => {
+                const files = e.dataTransfer.files;
+                if (files.length > 0 && files[0].type === 'application/pdf') {
+                    selectedFile = files[0];
+                    document.getElementById('dropText').innerText = "📄 Selected: " + selectedFile.name;
+                }
+            });
+
+            fileInput.addEventListener('change', () => {
+                if (fileInput.files.length > 0) {
+                    selectedFile = fileInput.files[0];
+                    document.getElementById('dropText').innerText = "📄 Selected: " + selectedFile.name;
+                }
+            });
+
+            async function startGeneration() {
+                if (!selectedFile) { alert("Please select a PDF file!"); return; }
+
+                const formData = new FormData();
+                formData.append("file", selectedFile);
+                formData.append("voice", document.getElementById('voiceSelect').value);
+
+                document.getElementById('submitBtn').disabled = true;
+                document.getElementById('progressBox').style.display = 'block';
+                document.getElementById('resultBox').style.display = 'none';
+
+                try {
+                    const res = await fetch('/api/generate-audio', { method: 'POST', body: formData });
+                    const data = await res.json();
+
+                    if (!res.ok) throw new Error(data.detail || "Upload failed");
+
+                    pollProgress(data.job_id);
+                } catch (err) {
+                    document.getElementById('statusText').innerText = "❌ " + err.message;
+                    document.getElementById('submitBtn').disabled = false;
+                }
+            }
+
+            function pollProgress(jobId) {
+                const interval = setInterval(async () => {
+                    const res = await fetch(`/api/progress/${jobId}`);
+                    const data = await res.json();
+
+                    document.getElementById('progressBar').style.width = data.progress + "%";
+                    document.getElementById('statusText').innerText = data.status;
+
+                    if (data.progress === 100) {
+                        clearInterval(interval);
+                        document.getElementById('submitBtn').disabled = false;
+                        document.getElementById('audioPlayer').src = data.audio_url;
+                        
+                        const dl = document.getElementById('downloadBtn');
+                        dl.href = data.audio_url;
+                        dl.download = data.filename;
+                        
+                        document.getElementById('resultBox').style.display = 'block';
+                    } else if (data.status.startsWith("Error")) {
+                        clearInterval(interval);
+                        document.getElementById('submitBtn').disabled = false;
+                    }
+                }, 1000);
+            }
+        </script>
+    </body>
+    </html>
+    """
